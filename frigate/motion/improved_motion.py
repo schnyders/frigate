@@ -2,7 +2,6 @@ import logging
 
 import cv2
 import numpy as np
-from scipy.ndimage import gaussian_filter
 
 from frigate.camera import PTZMetrics
 from frigate.config.config import RuntimeMotionConfig
@@ -65,6 +64,61 @@ def uint8_percentiles(
     return results
 
 
+class GaussianBlur:
+    """Gaussian blur that matches scipy.ndimage.gaussian_filter for uint8 frames.
+
+    scipy filters one axis at a time, sums each output pixel as
+    center * w[0] + (left_j + right_j) * w[j] in float64 (outermost j first),
+    and truncates the result to uint8 after each pass. The same arithmetic is
+    reproduced here with OpenCV gathering the neighbor sums (exact integers)
+    and numpy doing the float math in scipy's order. That is bit identical and
+    avoids the overhead of scipy's generic n-dimensional filter.
+    """
+
+    def __init__(self, sigma: float, radius: int) -> None:
+        # same kernel as scipy.ndimage._filters._gaussian_kernel1d
+        x = np.arange(-radius, radius + 1)
+        kernel = np.exp(-0.5 / (sigma * sigma) * x**2)
+        kernel = kernel / kernel.sum()
+        self.center_weight = float(kernel[radius])
+        self.pairs: list[tuple[np.ndarray, np.ndarray, float]] = []
+
+        # scipy accumulates the outermost pair first
+        for offset in range(radius, 0, -1):
+            # picks the two neighbors at this offset and adds them
+            pair = np.zeros(2 * radius + 1)
+            pair[radius - offset] = 1
+            pair[radius + offset] = 1
+            self.pairs.append(
+                (
+                    pair.reshape(-1, 1),
+                    np.ascontiguousarray(pair.reshape(1, -1)),
+                    float(kernel[radius + offset]),
+                )
+            )
+
+    def _filter_axis(self, frame: np.ndarray, vertical: bool) -> np.ndarray:
+        result = frame.astype(np.float64)
+        result *= self.center_weight
+
+        for vertical_pair, horizontal_pair, weight in self.pairs:
+            # BORDER_REFLECT (dcba|abcd) is scipy's default "reflect" mode
+            neighbors = cv2.filter2D(
+                frame,
+                cv2.CV_64F,
+                vertical_pair if vertical else horizontal_pair,
+                borderType=cv2.BORDER_REFLECT,
+            )
+            neighbors *= weight
+            result += neighbors
+
+        return result.astype(np.uint8)
+
+    def blur(self, frame: np.ndarray) -> np.ndarray:
+        """Blur a uint8 frame, filtering along rows first like scipy does."""
+        return self._filter_axis(self._filter_axis(frame, True), False)
+
+
 class ImprovedMotionDetector(MotionDetector):
     def __init__(
         self,
@@ -94,6 +148,7 @@ class ImprovedMotionDetector(MotionDetector):
         self.save_images = False
         self.calibrating = True
         self.blur_radius = blur_radius
+        self.gaussian_blur = GaussianBlur(sigma=1, radius=blur_radius)
         self.interpolation = interpolation
         self.contrast_values = np.zeros((contrast_frame_history, 2), np.uint8)
         self.contrast_values[:, 1:2] = 255
@@ -170,7 +225,7 @@ class ImprovedMotionDetector(MotionDetector):
         # Setting masked pixels to zero, to match the average frame at startup
         resized_frame[self.mask] = [0]
 
-        resized_frame = gaussian_filter(resized_frame, sigma=1, radius=self.blur_radius)
+        resized_frame = self.gaussian_blur.blur(resized_frame)
 
         if self.save_images:
             blurred_saved = resized_frame.copy()

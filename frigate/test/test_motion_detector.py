@@ -1,9 +1,15 @@
 import unittest
 
+import cv2
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 from frigate.config.camera.motion import MotionConfig
-from frigate.motion.improved_motion import ImprovedMotionDetector, uint8_percentiles
+from frigate.motion.improved_motion import (
+    GaussianBlur,
+    ImprovedMotionDetector,
+    uint8_percentiles,
+)
 
 
 class TestImprovedMotionDetector(unittest.TestCase):
@@ -135,6 +141,32 @@ class TestUint8Percentiles(unittest.TestCase):
                     np.percentile(frame, p).astype(np.uint8) for p in percentiles
                 ]
                 self.assertEqual(uint8_percentiles(frame, percentiles), expected)
+
+
+class TestGaussianBlur(unittest.TestCase):
+    def test_matches_scipy_gaussian_filter(self):
+        """OpenCV blur must match scipy's gaussian_filter bit for bit."""
+        rng = np.random.default_rng(0)
+
+        for radius in (1, 2):
+            blur = GaussianBlur(sigma=1, radius=radius)
+
+            for i in range(1000):
+                height, width = rng.integers(radius + 1, 200, 2)
+                frame = rng.integers(0, 256, (height, width), dtype=np.uint8)
+
+                # smooth, banded and flat frames land on exact integers
+                if i % 3 == 0:
+                    frame = cv2.GaussianBlur(frame, (0, 0), 3)
+                if i % 5 == 0:
+                    frame = (frame // 32 * 32).astype(np.uint8)
+                if i % 7 == 0:
+                    frame[:] = rng.integers(0, 256)
+
+                np.testing.assert_array_equal(
+                    blur.blur(frame),
+                    gaussian_filter(frame, sigma=1, radius=radius),
+                )
 
 
 if __name__ == "__main__":
