@@ -98,6 +98,7 @@ class ImprovedMotionDetector(MotionDetector):
         self.contrast_values = np.zeros((contrast_frame_history, 2), np.uint8)
         self.contrast_values[:, 1:2] = 255
         self.contrast_values_index = 0
+        self.lut_values = np.arange(256, dtype=np.float64)
         self.ptz_metrics = ptz_metrics
         self.autotracking_enabled = autotracking_enabled
         self.last_stop_time: float | None = None
@@ -154,10 +155,12 @@ class ImprovedMotionDetector(MotionDetector):
 
                 avg_min, avg_max = np.mean(self.contrast_values, axis=0)
 
-                resized_frame = np.clip(resized_frame, avg_min, avg_max)
-                resized_frame = (
-                    ((resized_frame - avg_min) / (avg_max - avg_min)) * 255
-                ).astype(np.uint8)
+                # stretch through a 256 entry lookup table: the float math
+                # runs once per possible pixel value instead of once per
+                # pixel, with the exact same result
+                lut = np.clip(self.lut_values, avg_min, avg_max)
+                lut = (((lut - avg_min) / (avg_max - avg_min)) * 255).astype(np.uint8)
+                resized_frame = cv2.LUT(resized_frame, lut)
 
         if self.save_images:
             contrasted_saved = resized_frame.copy()
