@@ -12,6 +12,59 @@ from frigate.util.image import grab_cv2_contours
 logger = logging.getLogger(__name__)
 
 
+def uint8_percentiles(
+    frame: np.ndarray, percentiles: tuple[float, ...]
+) -> list[np.uint8]:
+    """Compute percentiles of a uint8 image from its histogram.
+
+    np.percentile partitions a full copy of the frame for every call, which
+    made it the most expensive step of motion detection. A uint8 image only
+    has 256 possible values, so the sorted order statistics can be read from
+    the cumulative histogram instead. The interpolation mirrors numpy's
+    default "linear" method operation for operation, so the result is
+    identical to np.percentile(frame, q).astype(np.uint8).
+
+    Args:
+        frame: A uint8 image
+        percentiles: Percentiles to compute, each in the range 0-100
+
+    Returns:
+        The percentiles truncated to uint8, in the order requested
+    """
+    count = frame.size
+    hist = cv2.calcHist([frame], [0], None, [256], [0, 256]).ravel()
+    cdf = np.cumsum(hist.astype(np.int64))
+
+    results: list[np.uint8] = []
+    for percentile in percentiles:
+        quantile = percentile / 100
+        # same virtual index and gamma computation as numpy's linear method
+        virtual_index = (count - 1) * quantile
+
+        if virtual_index >= count - 1:
+            lower_index = upper_index = count - 1
+            gamma = 0.0
+        else:
+            lower_index = int(np.floor(virtual_index))
+            upper_index = lower_index + 1
+            gamma = virtual_index - lower_index
+
+        # value of the n-th smallest pixel is the first bin whose cumulative
+        # count exceeds n
+        lower, upper = np.searchsorted(cdf, (lower_index, upper_index), "right")
+        diff = int(upper) - int(lower)
+
+        if gamma >= 0.5:
+            value = int(upper) - diff * (1 - gamma)
+        else:
+            value = int(lower) + diff * gamma
+
+        # truncate like ndarray.astype(np.uint8)
+        results.append(np.uint8(int(value)))
+
+    return results
+
+
 class ImprovedMotionDetector(MotionDetector):
     def __init__(
         self,
@@ -87,8 +140,7 @@ class ImprovedMotionDetector(MotionDetector):
         # Improve contrast
         if self.config.improve_contrast:
             # TODO tracking moving average of min/max to avoid sudden contrast changes
-            min_value = np.percentile(resized_frame, 4).astype(np.uint8)
-            max_value = np.percentile(resized_frame, 96).astype(np.uint8)
+            min_value, max_value = uint8_percentiles(resized_frame, (4, 96))
             # skip contrast calcs if the image is a single color
             if min_value < max_value:
                 # keep track of the last 50 contrast values
