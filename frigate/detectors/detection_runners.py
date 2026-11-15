@@ -1,8 +1,10 @@
 """Base runner implementation for ONNX models."""
 
+import hashlib
 import logging
 import os
 import platform
+import shutil
 import threading
 from abc import ABC, abstractmethod
 from typing import Any
@@ -18,6 +20,69 @@ logger = logging.getLogger(__name__)
 
 # Process-wide lock serializing all OpenVINO compile/inference calls
 _OPENVINO_LOCK = threading.Lock()
+
+OPENVINO_CACHE_DIR = os.path.join(MODEL_CACHE_DIR, "openvino", "compiled")
+
+
+def get_openvino_cache_dir(model_path: str) -> str | None:
+    """Get a compiled model cache directory for an OpenVINO model file.
+
+    Compiling a model for an Intel GPU or NPU builds its kernels from scratch
+    and takes seconds per model on every start, which OpenVINO can skip by
+    loading a previously compiled blob from CACHE_DIR. OpenVINO does not
+    notice when only the weights of a model are replaced at the same path,
+    so each model gets its own directory that is cleared whenever the size
+    or modification time of its files changes.
+
+    Args:
+        model_path: Path to the model file passed to compile_model
+
+    Returns:
+        The cache directory, or None if it can not be used
+    """
+    model_files = [model_path]
+    weights_path = os.path.splitext(model_path)[0] + ".bin"
+
+    if model_path.endswith(".xml") and os.path.isfile(weights_path):
+        model_files.append(weights_path)
+
+    stamps = []
+
+    for path in model_files:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+
+        stamps.append(f"{os.path.abspath(path)}:{stat.st_size}:{stat.st_mtime_ns}")
+
+    stamp = ";".join(stamps)
+
+    model_key = hashlib.sha256(os.path.abspath(model_path).encode()).hexdigest()
+    cache_dir = os.path.join(OPENVINO_CACHE_DIR, model_key[:16])
+    stamp_path = os.path.join(cache_dir, "model_stamp")
+
+    try:
+        with open(stamp_path) as f:
+            if f.read() == stamp:
+                return cache_dir
+    except OSError:
+        pass
+
+    # the model changed or was never cached, start from an empty directory
+    shutil.rmtree(cache_dir, ignore_errors=True)
+
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+
+        with open(stamp_path, "w") as f:
+            f.write(stamp)
+    except OSError as e:
+        logger.debug("OpenVINO model cache is not available: %s", e)
+        return None
+
+    return cache_dir
+
 
 # model file path -> (model type, device the runner actually loaded on); the
 # embeddings maintainer folds this per enrichment for the stats endpoint.
@@ -472,6 +537,12 @@ class OpenVINOModelRunner(BaseModelRunner):
                 self.ov_core.set_property("GPU", {"GPU_QUEUE_THROTTLE": "LOW"})
             except Exception as e:
                 logger.debug(f"GPU_QUEUE_THROTTLE not supported: {e}")
+
+        # reuse compiled kernels from previous starts instead of rebuilding them
+        cache_dir = get_openvino_cache_dir(model_path)
+
+        if cache_dir is not None:
+            self.ov_core.set_property({"CACHE_DIR": cache_dir})
 
         # Some keys must be passed as compile-time config so that it can be caught
         compile_config = {}

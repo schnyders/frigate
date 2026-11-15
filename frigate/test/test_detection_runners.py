@@ -1,5 +1,7 @@
 """Tests for ONNX Runtime session option selection."""
 
+import os
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -8,6 +10,7 @@ import onnxruntime as ort
 
 from frigate.detectors.detection_runners import (
     CudaGraphRunner,
+    get_openvino_cache_dir,
     get_ort_session_options,
 )
 from frigate.detectors.detector_config import ModelTypeEnum
@@ -105,3 +108,60 @@ class TestCudaGraphRunner(unittest.TestCase):
 
         self.assertEqual(self._annotations(), [None])
         runner._input_ortvalue.update_inplace.assert_called_once()
+
+
+class TestOpenVINOCacheDir(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = patch(
+            "frigate.detectors.detection_runners.OPENVINO_CACHE_DIR",
+            os.path.join(self.tmp.name, "cache"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.model_path = os.path.join(self.tmp.name, "model.xml")
+        self.weights_path = os.path.join(self.tmp.name, "model.bin")
+        self._write(self.model_path, b"<net/>", 1)
+        self._write(self.weights_path, b"weights", 1)
+
+    def _write(self, path: str, data: bytes, mtime: int) -> None:
+        with open(path, "wb") as f:
+            f.write(data)
+        os.utime(path, (mtime, mtime))
+
+    def _add_cached_blob(self, cache_dir: str) -> str:
+        blob = os.path.join(cache_dir, "123.blob")
+        self._write(blob, b"compiled", 1)
+        return blob
+
+    def test_unchanged_model_keeps_cache(self):
+        cache_dir = get_openvino_cache_dir(self.model_path)
+        blob = self._add_cached_blob(cache_dir)
+
+        self.assertEqual(get_openvino_cache_dir(self.model_path), cache_dir)
+        self.assertTrue(os.path.exists(blob))
+
+    def test_replaced_weights_clear_cache(self):
+        """OpenVINO does not notice new weights, so the stale blob must go."""
+        cache_dir = get_openvino_cache_dir(self.model_path)
+        blob = self._add_cached_blob(cache_dir)
+        self._write(self.weights_path, b"new weights", 2)
+
+        self.assertEqual(get_openvino_cache_dir(self.model_path), cache_dir)
+        self.assertFalse(os.path.exists(blob))
+
+    def test_models_get_separate_directories(self):
+        other_path = os.path.join(self.tmp.name, "other.onnx")
+        self._write(other_path, b"onnx", 1)
+
+        self.assertNotEqual(
+            get_openvino_cache_dir(self.model_path),
+            get_openvino_cache_dir(other_path),
+        )
+
+    def test_missing_model_is_not_cached(self):
+        self.assertIsNone(
+            get_openvino_cache_dir(os.path.join(self.tmp.name, "missing.onnx"))
+        )
