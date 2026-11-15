@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 
 from frigate.config.camera.motion import MotionConfig
-from frigate.motion.improved_motion import ImprovedMotionDetector
+from frigate.motion.improved_motion import ImprovedMotionDetector, uint8_percentiles
 
 
 class TestImprovedMotionDetector(unittest.TestCase):
@@ -113,6 +113,28 @@ class TestImprovedMotionDetector(unittest.TestCase):
             self.detector.calibrating,
             "Detector should be in calibrating state after skip event",
         )
+
+
+class TestUint8Percentiles(unittest.TestCase):
+    def test_matches_numpy_percentile(self):
+        """Histogram percentiles must match np.percentile bit for bit."""
+        rng = np.random.default_rng(0)
+
+        for i in range(2000):
+            height, width = rng.integers(1, 200, 2)
+            frame = rng.integers(0, 256, (height, width), dtype=np.uint8)
+
+            # few distinct values and flat frames hit the interpolation edges
+            if i % 3 == 0:
+                frame = (frame // rng.integers(1, 128) * 3).astype(np.uint8)
+            if i % 11 == 0:
+                frame[:] = rng.integers(0, 256)
+
+            for percentiles in [(4, 96), (0, 100), (1, 99.5)]:
+                expected = [
+                    np.percentile(frame, p).astype(np.uint8) for p in percentiles
+                ]
+                self.assertEqual(uint8_percentiles(frame, percentiles), expected)
 
 
 if __name__ == "__main__":
