@@ -913,6 +913,104 @@ def yuv_region_2_bgr(frame, region):
         raise
 
 
+def yuv_region_2_color_downscaled(
+    frame: np.ndarray,
+    region: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    color_conversion: int,
+) -> np.ndarray | None:
+    """Crop a region from an I420 frame, downscale it and convert its color.
+
+    Converting the full region to RGB/BGR first and then shrinking it to the
+    model size converts many more pixels than the model ever sees. Scaling
+    the Y, U and V planes directly to the model size and converting
+    afterwards produces the same image apart from rounding (on average
+    about one level per channel) at a fraction of the cost. When the region
+    is inside the frame the planes are read in place, without first copying
+    the region into a new buffer.
+
+    Args:
+        frame: I420 frame with shape (height * 3 / 2, width)
+        region: Square region (x1, y1, x2, y2), may extend beyond the frame
+        width: Output width, must be even
+        height: Output height, must be even
+        color_conversion: cv2.COLOR_YUV2RGB_I420 or cv2.COLOR_YUV2BGR_I420
+
+    Returns:
+        The converted (height, width, 3) image, or None when the region
+        would have to be upscaled and the caller should convert first
+    """
+    region_width = region[2] - region[0]
+    region_height = region[3] - region[1]
+
+    if width % 2 or height % 2 or region_width <= width or region_height <= height:
+        return None
+
+    frame_height = frame.shape[0] // 3 * 2
+    frame_width = frame.shape[1]
+
+    if (
+        region[0] >= 0
+        and region[1] >= 0
+        and region[2] <= frame_width
+        and region[3] <= frame_height
+    ):
+        source = frame
+        source_width = frame_width
+        source_height = frame_height
+        x_offset = region[0]
+        y_offset = region[1]
+        # same even width and multiple of 4 height that yuv_crop_and_resize uses
+        crop_width = region_width // 2 * 2
+        crop_height = region_height // 4 * 4
+    else:
+        # pad the parts of the region outside the frame with black
+        source = yuv_crop_and_resize(frame, region)
+        source_width = source_height = crop_width = crop_height = source.shape[1]
+        x_offset = y_offset = 0
+
+    y_count = source_width * source_height
+    uv_count = y_count // 4
+    source_data = source.ravel()
+    y_plane = source_data[:y_count].reshape(source_height, source_width)
+    u_plane = source_data[y_count : y_count + uv_count].reshape(
+        source_height // 2, source_width // 2
+    )
+    v_plane = source_data[y_count + uv_count : y_count + 2 * uv_count].reshape(
+        source_height // 2, source_width // 2
+    )
+
+    out_y_count = width * height
+    out_uv_count = out_y_count // 4
+    out = np.empty((height * 3 // 2, width), np.uint8)
+    out_data = out.reshape(-1)
+    cv2.resize(
+        y_plane[y_offset : y_offset + crop_height, x_offset : x_offset + crop_width],
+        dsize=(width, height),
+        dst=out_data[:out_y_count].reshape(height, width),
+        interpolation=cv2.INTER_LINEAR,
+    )
+
+    uv_x_offset = x_offset // 2
+    uv_y_offset = y_offset // 2
+    for plane, start in (
+        (u_plane, out_y_count),
+        (v_plane, out_y_count + out_uv_count),
+    ):
+        cv2.resize(
+            plane[
+                uv_y_offset : uv_y_offset + crop_height // 2,
+                uv_x_offset : uv_x_offset + crop_width // 2,
+            ],
+            dsize=(width // 2, height // 2),
+            dst=out_data[start : start + out_uv_count].reshape(height // 2, width // 2),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    return cv2.cvtColor(out, color_conversion)
+
+
 def intersection(box_a, box_b) -> list[int] | None:
     """Return intersection box or None if boxes do not intersect."""
     if (

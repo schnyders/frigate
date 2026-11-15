@@ -26,6 +26,7 @@ from frigate.util.image import (
     intersection,
     intersection_over_union,
     yuv_region_2_bgr,
+    yuv_region_2_color_downscaled,
     yuv_region_2_rgb,
     yuv_region_2_yuv,
 )
@@ -286,12 +287,26 @@ def get_min_region_size(model_config: ModelConfig) -> int:
 
 
 def create_tensor_input(frame, model_config: ModelConfig, region):
-    if model_config.input_pixel_format == PixelFormatEnum.rgb:
-        cropped_frame = yuv_region_2_rgb(frame, region)
-    elif model_config.input_pixel_format == PixelFormatEnum.bgr:
-        cropped_frame = yuv_region_2_bgr(frame, region)
-    else:
+    if model_config.input_pixel_format == PixelFormatEnum.yuv:
         cropped_frame = yuv_region_2_yuv(frame, region)
+    else:
+        rgb = model_config.input_pixel_format == PixelFormatEnum.rgb
+        # regions are usually larger than the model input, so shrink them while
+        # still in YUV and only color convert the pixels the model will see
+        cropped_frame = yuv_region_2_color_downscaled(
+            frame,
+            region,
+            model_config.width,
+            model_config.height,
+            cv2.COLOR_YUV2RGB_I420 if rgb else cv2.COLOR_YUV2BGR_I420,
+        )
+
+        if cropped_frame is None:
+            cropped_frame = (
+                yuv_region_2_rgb(frame, region)
+                if rgb
+                else yuv_region_2_bgr(frame, region)
+            )
 
     # Resize if needed
     if cropped_frame.shape != (model_config.height, model_config.width, 3):
