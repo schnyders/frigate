@@ -9,6 +9,7 @@ import os
 import random
 import re
 import string
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -1167,11 +1168,90 @@ class LicensePlateProcessingMixin:
         logger.debug(
             f"  Selected rep from best cluster: '{rep['plate']}' (conf: {rep['conf']:.3f})"
         )
+
+        voted = self._vote_plate_characters(best_cluster)
+
+        if voted is not None and voted[0] != rep["plate"]:
+            matching = [v for v in best_cluster if v["plate"] == voted[0]]
+
+            if matching:
+                # the consensus was read as a whole at least once, keep that read
+                rep = max(matching, key=lambda v: v["conf"])
+            else:
+                logger.debug(
+                    f"  Character vote built '{voted[0]}' (conf: {voted[1]:.3f})"
+                )
+                return voted[0], voted[1], voted[2], rep["area"]
         logger.debug(
             f"  Final clustered plate: '{rep['plate']}' (conf: {rep['conf']:.3f})"
         )
 
         return rep["plate"], rep["conf"], rep["char_confidences"], rep["area"]
+
+    @staticmethod
+    def _vote_plate_characters(
+        variants: list[dict[str, Any]],
+    ) -> tuple[str, float, list[float]] | None:
+        """Build a plate from per character votes across several reads of it.
+
+        On blurry, noisy or dark frames each read of a plate tends to get a
+        different character wrong, so the single most confident read is often
+        still wrong while the reads agree on every position by majority.
+        Reads of the most common length vote on each position, weighted by
+        the confidence of that character.
+
+        Args:
+            variants: Reads of the same plate, as stored by lpr_process
+
+        Returns:
+            The voted plate, its average confidence and the per character
+            confidences, or None if there are not enough reads to vote
+        """
+        by_length: dict[int, list[dict[str, Any]]] = defaultdict(list)
+
+        for variant in variants:
+            if variant["plate"]:
+                by_length[len(variant["plate"])].append(variant)
+
+        if not by_length:
+            return None
+
+        # a dropped or extra character shifts every position after it, so
+        # only reads of the most common length can be compared directly
+        candidates = max(
+            by_length.values(),
+            key=lambda reads: (len(reads), sum(v["conf"] for v in reads)),
+        )
+
+        if len(candidates) < 3:
+            return None
+
+        plate_chars: list[str] = []
+        char_confidences: list[float] = []
+
+        for position in range(len(candidates[0]["plate"])):
+            votes: dict[str, list[float]] = defaultdict(list)
+
+            for variant in candidates:
+                confidences = variant["char_confidences"]
+                # replace rules or joined lines can change the length of the
+                # text, then fall back to the read's average confidence
+                confidence = (
+                    confidences[position]
+                    if len(confidences) == len(variant["plate"])
+                    else variant["conf"]
+                )
+                votes[variant["plate"][position]].append(confidence)
+
+            char, confidences = max(votes.items(), key=lambda vote: sum(vote[1]))
+            plate_chars.append(char)
+            char_confidences.append(sum(confidences) / len(confidences))
+
+        return (
+            "".join(plate_chars),
+            sum(char_confidences) / len(char_confidences),
+            char_confidences,
+        )
 
     def _passes_plate_filters(self, camera: str, plate: str) -> bool:
         """Check a plate against the configured length and format filters."""
